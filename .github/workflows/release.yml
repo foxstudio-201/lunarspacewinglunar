@@ -173,12 +173,6 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Login to Docker Hub
-        uses: docker/login-action@v4
-        with:
-          username: ${{ secrets.DOCKERHUB_USERNAME }}
-          password: ${{ secrets.DOCKERHUB_TOKEN }}
-
       - name: Prepare binaries
         run: |
           mkdir -p .docker/amd64 .docker/arm64 .docker/riscv64 .docker/ppc64le
@@ -209,10 +203,10 @@ jobs:
             SUFFIXES+=("latest")
           fi
 
-          # Emit each suffix for both registries.
+          # Emit each suffix for GHCR only.
           DOCKER_TAGS=""
           for t in "${SUFFIXES[@]}"; do
-            DOCKER_TAGS="${DOCKER_TAGS}${DOCKER_TAGS:+,}${GHCR_IMAGE}:${t},${DOCKERHUB_IMAGE}:${t}"
+            DOCKER_TAGS="${DOCKER_TAGS}${DOCKER_TAGS:+,}${GHCR_IMAGE}:${t}"
           done
 
           echo "DOCKER_TAGS=$DOCKER_TAGS" >> $GITHUB_ENV
@@ -238,16 +232,5 @@ jobs:
           sbom-path: sbom/sbom-source.cyclonedx.json
           push-to-registry: true
 
-      - name: Attach source SBOM attestation to image (Docker Hub)
-        uses: actions/attest@v4
-        with:
-          subject-name: ${{ env.DOCKERHUB_IMAGE }}
-          subject-digest: ${{ steps.build.outputs.digest }}
-          sbom-path: sbom/sbom-source.cyclonedx.json
-          push-to-registry: true
-
       - name: Sign image (GHCR)
         run: cosign sign --yes ${{ env.GHCR_IMAGE }}@${{ steps.build.outputs.digest }}
-
-      - name: Sign image (Docker Hub)
-        run: cosign sign --yes ${{ env.DOCKERHUB_IMAGE }}@${{ steps.build.outputs.digest }}
