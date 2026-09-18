@@ -15,7 +15,7 @@ impl crate::commands::CliCommand<VersionArgs> for VersionCommand {
         Box::new(|_config, _arg_matches| {
             Box::pin(async move {
                 println!(
-                    "github.com/foxstudio-201/LunarSpaceWingLunar {} ({})",
+                    "github.com/foxstudio-201/lunarspacewinglunar {} ({})",
                     crate::full_version(),
                     crate::TARGET
                 );

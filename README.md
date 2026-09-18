@@ -5,9 +5,9 @@
 Forked from [Calagopus Wings](https://github.com/calagopus/wings)
 
 [![Rust](https://img.shields.io/badge/rust-stable-orange.svg?logo=rust)](https://www.rust-lang.org/)
-[![License](https://img.shields.io/github/license/foxstudio-201/LunarSpaceWingLunar?color=blue)](https://github.com/foxstudio-201/LunarSpaceWingLunar/blob/main/LICENSE)
-[![GitHub issues](https://img.shields.io/github/issues/foxstudio-201/LunarSpaceWingLunar)](https://github.com/foxstudio-201/LunarSpaceWingLunar/issues)
-[![GitHub stars](https://img.shields.io/github/stars/foxstudio-201/LunarSpaceWingLunar)](https://github.com/foxstudio-201/LunarSpaceWingLunar/stargazers)
+[![License](https://img.shields.io/github/license/foxstudio-201/lunarspacewinglunar?color=blue)](https://github.com/foxstudio-201/lunarspacewinglunar/blob/main/LICENSE)
+[![GitHub issues](https://img.shields.io/github/issues/foxstudio-201/lunarspacewinglunar)](https://github.com/foxstudio-201/lunarspacewinglunar/issues)
+[![GitHub stars](https://img.shields.io/github/stars/foxstudio-201/lunarspacewinglunar)](https://github.com/foxstudio-201/lunarspacewinglunar/stargazers)
 [![Discord](https://img.shields.io/discord/1429911351777824892?label=discord&logo=discord&color=5865F2)](https://discord.gg/uSM8tvTxBV)
 
 A rewrite of [Pterodactyl Wings](https://github.com/pterodactyl/wings) in the Rust programming language. This rewrite aims to be 100% API compatible while implementing new features, better performance and more stability.
@@ -325,4 +325,4 @@ ignore_panel_wings_upgrades: false
 
 ## Star History
 
-![Star History Chart](https://api.star-history.com/chart?repos=foxstudio-201/LunarSpaceWingLunar&type=date&legend=top-left)
+![Star History Chart](https://api.star-history.com/chart?repos=foxstudio-201/lunarspacewinglunar&type=date&legend=top-left)

@@ -400,7 +400,7 @@ async fn main_rt() {
             tracing::info!("                    __/ | | '__/ __|");
             tracing::info!("                   |___/  | |  \\__ \\");
             tracing::info!("{: >25} |_|  |___/", crate::VERSION);
-            tracing::info!("github.com/foxstudio-201/LunarSpaceWingLunar#{}\n", crate::GIT_COMMIT);
+            tracing::info!("github.com/foxstudio-201/lunarspacewinglunar#{}\n", crate::GIT_COMMIT);
         }
     }
 

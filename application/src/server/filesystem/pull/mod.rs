@@ -34,7 +34,7 @@ fn get_download_client(
     let redirect_config = Arc::clone(config);
     let client = Arc::new(
         reqwest::Client::builder()
-            .user_agent("LunarSpace Wings (https://github.com/foxstudio-201/LunarSpaceWingLunar)")
+            .user_agent("LunarSpace Wings (https://github.com/foxstudio-201/lunarspacewinglunar)")
             .connect_timeout(std::time::Duration::from_secs(30))
             .no_proxy()
             .dns_resolver(Arc::new(crate::net::BlockedIpResolver::new(
