@@ -1,0 +1,223 @@
+use base64::Engine;
+use clap::{Args, FromArgMatches};
+use colored::Colorize;
+use dialoguer::{Confirm, Input, theme::ColorfulTheme};
+use std::sync::Arc;
+
+#[derive(Args)]
+pub struct ConfigureArgs {
+    #[arg(
+        long = "allow-insecure",
+        help = "allow insecure connections to the panel (e.g., invalid TLS certs)"
+    )]
+    pub allow_insecure: bool,
+
+    #[arg(
+        short = 'o',
+        long = "override",
+        help = "override the current configuration if it exists"
+    )]
+    pub r#override: bool,
+
+    #[arg(long = "panel-url", help = "the url of the panel")]
+    pub panel_url: Option<String>,
+
+    #[arg(long = "join-data", help = "base64 encoded join data from the panel")]
+    pub join_data: Option<String>,
+
+    #[arg(long = "token", help = "the token to authenticate with the panel")]
+    pub token: Option<String>,
+
+    #[arg(long = "node", help = "the node id to configure")]
+    pub node: Option<usize>,
+}
+
+fn apply(
+    env: Option<&Arc<crate::config::Config>>,
+    patch: serde_json::Value,
+) -> Result<crate::config::InnerConfig, anyhow::Error> {
+    let mut config = match env {
+        Some(config) => serde_json::to_value(&**config.load())?,
+        None => serde_json::to_value(crate::config::InnerConfig::default())?,
+    };
+
+    json_patch::merge(&mut config, &patch);
+
+    Ok(serde_json::from_value(config)?)
+}
+
+pub struct ConfigureCommand;
+
+impl crate::commands::CliCommand<ConfigureArgs> for ConfigureCommand {
+    fn get_command(&self, command: clap::Command) -> clap::Command {
+        command
+    }
+
+    fn get_executor(self) -> Box<crate::commands::ExecutorFunc> {
+        Box::new(|env, arg_matches| {
+            Box::pin(async move {
+                let args = ConfigureArgs::from_arg_matches(&arg_matches)?;
+
+                let config_path = match env.as_ref() {
+                    Some(config) => config.path.clone(),
+                    None => arg_matches
+                        .get_one::<String>("config")
+                        .cloned()
+                        .or_else(|| crate::config::Config::find().map(String::from))
+                        .unwrap_or_else(|| crate::config::Config::DEFAULT_PATH.to_string()),
+                };
+
+                let exists = std::path::Path::new(&config_path).exists();
+
+                if exists && env.is_none() {
+                    eprintln!(
+                        "{} {}",
+                        "the existing configuration could not be read, its values will not be kept:"
+                            .yellow(),
+                        config_path
+                    );
+                }
+
+                if exists && !args.r#override {
+                    let confirm = Confirm::with_theme(&ColorfulTheme::default())
+                        .with_prompt(format!(
+                            "do you want to {} the configuration at {config_path}?",
+                            if env.is_some() { "update" } else { "override" }
+                        ))
+                        .default(false)
+                        .interact()?;
+
+                    if !confirm {
+                        return Ok(1);
+                    }
+                }
+
+                if let Some(join_data) = args.join_data {
+                    let decoding_engine = base64::engine::general_purpose::GeneralPurpose::new(
+                        &base64::alphabet::STANDARD,
+                        Default::default(),
+                    );
+
+                    let decoded = match decoding_engine.decode(&join_data) {
+                        Ok(decoded) => decoded,
+                        Err(_) => {
+                            eprintln!("{}", "failed to decode join data!".red());
+                            return Ok(1);
+                        }
+                    };
+
+                    let response: serde_json::Value = match serde_norway::from_slice(&decoded) {
+                        Ok(response) => response,
+                        Err(_) => {
+                            eprintln!("{}", "failed to decode join data payload!".red());
+                            return Ok(1);
+                        }
+                    };
+
+                    let response = match apply(env.as_ref(), response) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            eprintln!("{} {:#?}", "failed to apply join data:".red(), err);
+                            return Ok(1);
+                        }
+                    };
+
+                    crate::config::Config::save_new(&config_path, response)?;
+
+                    println!("{}", "successfully configured wings.".green());
+
+                    Ok(0)
+                } else {
+                    let panel_url = match args.panel_url {
+                        Some(url) => url,
+                        None => Input::with_theme(&ColorfulTheme::default())
+                            .with_prompt("panel url")
+                            .interact_text()?,
+                    };
+
+                    let panel_url = match reqwest::Url::parse(&panel_url) {
+                        Ok(url) => url,
+                        Err(_) => {
+                            eprintln!("{}", "invalid url".red());
+                            return Ok(1);
+                        }
+                    };
+
+                    let token = match args.token {
+                        Some(token) => token,
+                        None => Input::with_theme(&ColorfulTheme::default())
+                            .with_prompt("token")
+                            .interact_text()?,
+                    };
+
+                    let node = match args.node {
+                        Some(node) => node,
+                        None => {
+                            let node: usize = Input::with_theme(&ColorfulTheme::default())
+                                .with_prompt("node id")
+                                .interact_text()?;
+
+                            if node == 0 {
+                                eprintln!("{}", "node id cannot be 0".red());
+                                return Ok(1);
+                            }
+
+                            node
+                        }
+                    };
+
+                    let client = reqwest::Client::builder()
+                        .tls_danger_accept_invalid_certs(args.allow_insecure)
+                        .build()?;
+
+                    let response = client
+                        .get(format!(
+                            "{}/api/application/nodes/{}/configuration",
+                            panel_url.to_string().trim_end_matches('/'),
+                            node
+                        ))
+                        .header("Authorization", format!("Bearer {token}"))
+                        .header("Accept", "application/vnd.pterodactyl.v1+json")
+                        .send()
+                        .await;
+
+                    let response = match response {
+                        Ok(res) => match res.text().await {
+                            Ok(text) => crate::remote::into_json::<serde_json::Value>(text),
+                            Err(err) => {
+                                eprintln!("{} {:#?}", "failed to read response body:".red(), err);
+                                return Ok(1);
+                            }
+                        },
+                        Err(err) => {
+                            eprintln!("{} {:#?}", "failed to connect to panel:".red(), err);
+                            return Ok(1);
+                        }
+                    };
+
+                    let response = match response {
+                        Ok(response) => response,
+                        Err(err) => {
+                            eprintln!("{} {:#?}", "failed to get configuration:".red(), err);
+                            return Ok(1);
+                        }
+                    };
+
+                    let response = match apply(env.as_ref(), response) {
+                        Ok(response) => response,
+                        Err(err) => {
+                            eprintln!("{} {:#?}", "failed to apply configuration:".red(), err);
+                            return Ok(1);
+                        }
+                    };
+
+                    crate::config::Config::save_new(&config_path, response)?;
+
+                    println!("{}", "successfully configured wings.".green());
+
+                    Ok(0)
+                }
+            })
+        })
+    }
+}

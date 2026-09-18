@@ -1,0 +1,146 @@
+[package]
+name = "wings-rs"
+rust-version = { workspace = true }
+version = "1.2.2"
+edition = "2024"
+
+[dependencies]
+tempfile = "3.27.0"
+unrar = { path = "../unrar-rs" }
+pbs-client = { path = "../pbs-client" }
+tundra-common = { git = "https://github.com/calagopus/tundra.git" }
+tracing = { version = "0.1.41", features = ["max_level_debug"] }
+tracing-subscriber = { version = "0.3.19", features = ["chrono"] }
+tracing-appender = "0.2.3"
+anyhow = "1.0.98"
+axum = { version = "0.8.1", features = ["http2", "ws", "multipart"] }
+axum-server = { version = "0.8.0", features = ["tls-rustls"] }
+axum-extra = { version = "0.12.1", features = ["query"] }
+tower-http = { version = "0.7.0", features = ["catch-panic"] }
+bollard = "0.21.0"
+serde = { workspace = true }
+serde_json = { workspace = true }
+utoipa = { version = "5.4.0", features = ["axum_extras", "preserve_order", "chrono", "indexmap", "uuid"] }
+utoipa-axum = "0.2.0"
+reqwest = { workspace = true }
+url = { workspace = true }
+tokio = { workspace = true }
+chrono = { version = "0.4.40", features = ["serde"] }
+colored = "3.0.0"
+jsonwebtoken = { version = "11.0.0", features = ["aws_lc_rs"] }
+nestify = "0.3.3"
+rayon = "1.10.0"
+serde_norway = "0.9.42"
+serde_default = "0.2.0"
+tokio-util = { version = "0.7.15", features = ["io-util"] }
+uuid = { workspace = true }
+rand = "0.10.0"
+tar = { workspace = true }
+zip = { version = "8.0.0", default-features = false, features = ["bzip2", "deflate-flate2-zlib-ng", "zstd", "lzma", "xz"] }
+sevenz-rust2 = { version = "0.22.2", features = ["deflate", "compress", "brotli", "zstd", "bzip2", "ppmd", "lz4"] }
+flate2 = { version = "1.1.1", default-features = false, features = ["zlib-ng"] }
+sha2 = { workspace = true }
+ddup-bak = "0.10.0"
+infer = "0.22.0"
+rustls = { workspace = true }
+bytes = { workspace = true }
+ignore = "0.4.23"
+sha1 = "0.11.0"
+futures = { workspace = true }
+russh = "0.63.1"
+russh-sftp = "2.1.1"
+md5 = "0.8.0"
+human_bytes = "0.4.3"
+nu-ansi-term = "0.50.3"
+clap = { version = "4.5.37", features = ["derive", "string"] }
+clap_complete = "4.6.7"
+dialoguer = { version = "0.12.0", default-features = false }
+sysinfo = { version = "0.39.0", default-features = false, features = ["disk", "network", "system", "user"] }
+crc32fast = { workspace = true }
+cap-std = "4.0.0"
+rustix = { version = "1.0.7", features = ["fs", "process", "net"] }
+cidr = { version = "0.3.1", features = ["serde"] }
+hickory-resolver = { workspace = true }
+constant_time_eq = "0.6.0"
+new_mime_guess = "4.0.4"
+async-trait = "0.1.88"
+chrono-tz = "0.10.4"
+gzp = { version = "2.0.0", default-features = false, features = ["deflate_zlib_ng"] }
+lzma-rust2 = { version = "0.20.1", features = ["optimization"] }
+bzip2 = "0.6.0"
+zstd = { workspace = true }
+base64 = "0.23.0"
+chunked_vec = "=0.5.1"
+async-channel = "2.5.0"
+lzzzz = "2.0.0"
+xmltree = { version = "0.12.0", features = ["attribute-order"] }
+xml = "1.3.0"
+regex = "1.12.2"
+serde_regex = "1.1.0"
+compact_str = { workspace = true, features = ["utoipa"] }
+memchr = "2.7.6"
+aho-corasick = "1.1.3"
+thin-vec = "0.2.14"
+moka = { version = "0.12.12", features = ["future"] }
+ouroboros = "0.18.5"
+percent-encoding = "2.3.2"
+positioned-io = { workspace = true }
+rmp-serde = "1.3.1"
+accept-header = "0.2.3"
+mime = "0.3.17"
+sntpc-net-tokio = "1.0.1"
+sntpc = { version = "0.11.0", features = ["std"] }
+hex = { workspace = true }
+json-patch = "4.2.0"
+itaf = "0.3.0"
+arc-swap = "1.9.1"
+rusqlite = { version = "0.40.0", features = ["bundled", "column_decltype"] }
+blake3 = "1.8.5"
+parking_lot = "0.12.5"
+toml_edit = "0.25.12"
+ini-roundtrip = "0.2.1"
+yrs = "0.27.2"
+croner = { version = "4.0.0", features = ["serde"] }
+rcgen = { version = "0.14.8", default-features = false, features = ["aws_lc_rs", "pem", "x509-parser"] }
+time = "0.3.55"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dependencies]
+tikv-jemallocator = "0.6.0"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+ktls = { version = "6.0.2", git = "https://github.com/KnorpelSenf/ktls.git", rev = "047f134ce25380087a55d6bfbfd2f14d839c0ba0", features = ["aws_lc_rs"] }
+tokio-rustls = "0.26.4"
+
+[target.'cfg(target_arch = "riscv64gc")'.dependencies]
+libz-ng-sys = "=1.1.23" # temporary pin due to riscv64 issues
+
+[dev-dependencies]
+tokio-test = "0.4.5"
+
+[target.'cfg(all(target_os = "linux", target_arch = "x86_64"))'.dev-dependencies]
+tikv-jemalloc-ctl = "0.6.0"
+
+[build-dependencies]
+ureq = { version = "3.3.0", default-features = false, features = ["rustls"] }
+serde = { workspace = true }
+serde_json = { workspace = true }
+zstd = { workspace = true }
+
+[lints.rust]
+linker_messages = "allow"
+
+[lints.clippy]
+all = { level = "warn", priority = -1 }
+# pedantic = { level = "warn", priority = -1 }
+
+unwrap_used = "deny"
+panic = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+
+indexing_slicing = "deny"
+string_slice = "deny"
+unwrap_in_result = "deny"
+panic_in_result_fn = "deny"
+missing_panics_doc = "warn"

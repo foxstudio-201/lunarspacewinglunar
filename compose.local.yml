@@ -1,0 +1,31 @@
+services:
+  wings:
+    image: ghcr.io/calagopus/wings:latest
+    restart: unless-stopped
+    environment:
+      TZ: "Europe/Berlin"
+      WINGS_UID: 988
+      WINGS_GID: 988
+      WINGS_USERNAME: calagopus
+    dns:
+      - 1.1.1.1
+      - 1.0.0.1
+    volumes:
+      - "/var/run/docker.sock:/var/run/docker.sock"
+      - "/var/lib/docker/containers/:/var/lib/docker/containers/"
+      # this is exclusively for the main wings configuration file, called config.yml
+      - "./config/:/etc/calagopus-wings/"
+      # if you split /var/lib/calagopus-wings up, make sure the following paths are all still covered by a volume:
+      # /var/lib/calagopus-wings/volumes (used for storing server files)
+      # /var/lib/calagopus-wings/diffs (used for storing file history diffs)
+      # /var/lib/calagopus-wings/vmounts (used for storing temporary mountpoints, DO NOT put this on a tmpfs, thats why its separate)
+      # /var/lib/calagopus-wings/archives (unused for wings-rs currently, may get a future use)
+      # /var/lib/calagopus-wings/backups (used for storing local backups of servers)
+      - "/var/lib/calagopus-wings/:/var/lib/calagopus-wings/"
+      - "./logs/:/var/log/calagopus-wings/"
+      - "/tmp/calagopus-wings/:/tmp/calagopus-wings/"
+      # do not mount directly to /etc/ssl/certs (right side), this will cause certificate issues within the container
+      - "/etc/ssl/certs/wings/:/etc/ssl/certs/wings/:ro"
+    ports:
+      - 8080:8080
+      - 2022:2022

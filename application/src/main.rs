@@ -1,0 +1,1089 @@
+use crate::{response::ApiResponse, routes::GetState, server::executor::ServerExecutor};
+use anyhow::Context;
+use axum::{
+    body::Body,
+    extract::{ConnectInfo, Request},
+    http::{HeaderMap, HeaderValue, Method, Response, StatusCode},
+    middleware::Next,
+    response::IntoResponse,
+};
+use colored::Colorize;
+use russh::server::Server;
+use std::{
+    fmt::Debug,
+    net::SocketAddr,
+    sync::{
+        Arc, LazyLock, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+    },
+    time::Instant,
+};
+use utoipa::openapi::security::{ApiKey, ApiKeyValue, SecurityScheme};
+use utoipa_axum::router::OpenApiRouter;
+
+pub static CLAP_COMMAND: OnceLock<clap::Command> = OnceLock::new();
+
+mod bins;
+mod commands;
+mod config;
+mod deserialize;
+mod io;
+mod models;
+mod net;
+mod payload;
+mod remote;
+mod response;
+mod routes;
+mod server;
+mod ssh;
+mod stats;
+mod threading;
+mod tls;
+#[cfg(unix)]
+mod tundra;
+mod utils;
+
+use payload::Payload;
+
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+const GIT_COMMIT: &str = env!("CARGO_GIT_COMMIT");
+const GIT_BRANCH: &str = env!("CARGO_GIT_BRANCH");
+const TARGET: &str = env!("CARGO_TARGET");
+
+/// 32 KiB - used for general IO
+const BUFFER_SIZE: usize = 32 * 1024;
+/// 4 MiB - used for transfers
+const TRANSFER_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+/// 4 KiB - used for WebSocket read buffer
+const WS_READ_BUFFER_SIZE: usize = 4 * 1024;
+
+fn full_version() -> String {
+    if GIT_BRANCH == "unknown" {
+        VERSION.to_string()
+    } else {
+        format!("{VERSION}:{GIT_COMMIT}@{GIT_BRANCH}")
+    }
+}
+
+fn spawn_blocking_handled<
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    f: F,
+) {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(Ok(_)) => {}
+            Ok(Err(err)) => {
+                tracing::error!("spawned blocking task failed: {:?}", err);
+            }
+            Err(err) => {
+                tracing::error!("spawned blocking task panicked: {:?}", err);
+            }
+        }
+    });
+}
+
+fn spawn_blocking_signalled<
+    F: FnOnce() -> Result<(), E> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    signal: crate::io::fallible_reader::FallibleSignal,
+    f: F,
+) {
+    tokio::spawn(async move {
+        match tokio::task::spawn_blocking(f).await {
+            Ok(Ok(_)) => signal.succeed(),
+            Ok(Err(err)) => {
+                tracing::error!("spawned blocking task failed: {:?}", err);
+                signal.fail(format!("{err:?}"));
+            }
+            Err(err) => {
+                tracing::error!("spawned blocking task panicked: {:?}", err);
+                signal.fail(format!("task panicked: {err:?}"));
+            }
+        }
+    });
+}
+
+fn spawn_handled<
+    F: std::future::Future<Output = Result<(), E>> + Send + 'static,
+    E: Debug + Send + 'static,
+>(
+    f: F,
+) {
+    tokio::spawn(async move {
+        match f.await {
+            Ok(_) => {}
+            Err(err) => {
+                tracing::error!("spawned async task failed: {:?}", err);
+            }
+        }
+    });
+}
+
+#[inline(always)]
+#[cold]
+fn cold_path() {}
+
+#[inline(always)]
+fn likely(b: bool) -> bool {
+    if b {
+        true
+    } else {
+        cold_path();
+        false
+    }
+}
+
+#[inline(always)]
+fn unlikely(b: bool) -> bool {
+    if b {
+        cold_path();
+        true
+    } else {
+        false
+    }
+}
+
+macro_rules! exit_error {
+    ($msg:expr) => {
+        {
+            use ::colored::Colorize;
+            eprintln!("{}", $msg.red());
+            std::process::exit(1);
+        }
+    };
+    ($fmt:expr, $($arg:tt)*) => {
+        {
+            use ::colored::Colorize;
+            eprintln!("{}", format!($fmt, $($arg)*).red());
+            std::process::exit(1);
+        }
+    };
+}
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[global_allocator]
+static ALLOC: tikv_jemallocator::Jemalloc = tikv_jemallocator::Jemalloc;
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const MALLOC_CONF: &std::ffi::CStr = c"background_thread:true,dirty_decay_ms:1000,muzzy_decay_ms:0,narenas:4,tcache_nslots_small_max:20,tcache_max:4096";
+
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+#[unsafe(export_name = "_rjem_malloc_conf")]
+static MALLOC_CONF_PTR: Option<&'static std::ffi::c_char> =
+    // SAFETY: MALLOC_CONF is a 'static nul-terminated C string, which is what
+    // jemalloc reads this symbol as during its initialization.
+    Some(unsafe { &*MALLOC_CONF.as_ptr() });
+
+fn handle_panic(err: Box<dyn std::any::Any + Send + 'static>) -> Response<Body> {
+    let details = if let Some(s) = err.downcast_ref::<String>() {
+        s.as_str()
+    } else if let Some(s) = err.downcast_ref::<&str>() {
+        s
+    } else {
+        "unknown panic"
+    };
+
+    tracing::error!("a panic occurred while handling a request: {}", details);
+
+    ApiResponse::error("internal server error")
+        .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+        .into_response()
+}
+
+struct RequestLogBudget {
+    second: AtomicU64,
+    logged: AtomicUsize,
+    suppressed: AtomicU64,
+}
+
+impl RequestLogBudget {
+    fn take(&self, limit: usize) -> (bool, u64) {
+        static START: LazyLock<Instant> = LazyLock::new(Instant::now);
+
+        let now = START.elapsed().as_secs();
+        let second = self.second.load(Ordering::Relaxed);
+        let suppressed = if second != now
+            && self
+                .second
+                .compare_exchange(second, now, Ordering::AcqRel, Ordering::Relaxed)
+                .is_ok()
+        {
+            self.logged.store(0, Ordering::Relaxed);
+            self.suppressed.swap(0, Ordering::Relaxed)
+        } else {
+            0
+        };
+
+        if self.logged.fetch_add(1, Ordering::Relaxed) < limit {
+            (true, suppressed)
+        } else {
+            self.suppressed.fetch_add(1, Ordering::Relaxed);
+            (false, suppressed)
+        }
+    }
+}
+
+static REQUEST_LOG_BUDGET: RequestLogBudget = RequestLogBudget {
+    second: AtomicU64::new(0),
+    logged: AtomicUsize::new(0),
+    suppressed: AtomicU64::new(0),
+};
+
+async fn handle_request(
+    state: GetState,
+    req: Request<Body>,
+    next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    let limit = state.config.load().api.request_log_limit;
+    let (log, suppressed) = if limit == 0 {
+        (true, 0)
+    } else {
+        REQUEST_LOG_BUDGET.take(limit)
+    };
+
+    if suppressed > 0 {
+        tracing::info!(
+            "suppressed {} http request log lines (api.request_log_limit = {})",
+            suppressed,
+            limit
+        );
+    }
+
+    if log {
+        tracing::info!(
+            path = req.uri().path(),
+            query = %crate::utils::redact_query(req.uri().query().unwrap_or_default()),
+            "http {}",
+            req.method().to_string().to_lowercase(),
+        );
+    }
+
+    Ok(crate::response::ACCEPT_HEADER
+        .scope(crate::response::accept_from_headers(req.headers()), async {
+            next.run(req).await
+        })
+        .await)
+}
+
+async fn handle_cors(
+    state: crate::routes::GetState,
+    req: Request,
+    next: Next,
+) -> Result<Response<Body>, StatusCode> {
+    let method = req.method().clone();
+    let mut headers = HeaderMap::new();
+
+    headers.insert(
+        "Access-Control-Allow-Credentials",
+        HeaderValue::from_static("true"),
+    );
+    headers.insert(
+        "Access-Control-Allow-Methods",
+        HeaderValue::from_static("GET, HEAD, POST, PATCH, PUT, DELETE, OPTIONS"),
+    );
+    headers.insert("Access-Control-Allow-Headers", HeaderValue::from_static("Accept, Accept-Encoding, Authorization, Cache-Control, Content-Type, Content-Length, Origin, X-Real-IP, X-CSRF-Token, Upload-Offset, Upload-Length, Upload-Complete"));
+    headers.insert(
+        "Access-Control-Expose-Headers",
+        HeaderValue::from_static("Upload-Offset"),
+    );
+
+    if state.config.load().allow_cors_private_network {
+        headers.insert(
+            "Access-Control-Request-Private-Network",
+            HeaderValue::from_static("true"),
+        );
+    }
+
+    headers.insert("Access-Control-Max-Age", HeaderValue::from_static("7200"));
+
+    if let Some(origin) = req.headers().get("Origin")
+        && origin.to_str().ok() != Some(state.config.load().remote.as_str())
+    {
+        for o in state.config.load().allowed_origins.iter() {
+            if o == "*" || origin.to_str().ok() == Some(o.as_str()) {
+                if let Ok(o) = o.parse() {
+                    headers.insert("Access-Control-Allow-Origin", o);
+                }
+
+                break;
+            }
+        }
+    }
+
+    if !headers.contains_key("Access-Control-Allow-Origin") {
+        if let Ok(origin) = state.config.load().remote.parse() {
+            headers.insert("Access-Control-Allow-Origin", origin);
+        } else {
+            return Ok(ApiResponse::error("invalid remote URL configured")
+                .with_status(StatusCode::INTERNAL_SERVER_ERROR)
+                .into_response());
+        }
+    }
+
+    if method == Method::OPTIONS {
+        let mut response = Response::new(Body::empty());
+        response.headers_mut().extend(headers);
+        *response.status_mut() = StatusCode::NO_CONTENT;
+
+        return Ok(response);
+    }
+
+    let mut response = next.run(req).await;
+    response.headers_mut().extend(headers);
+
+    Ok(response)
+}
+
+async fn main_rt() {
+    let cli = crate::commands::CliCommandGroupBuilder::new(
+        "lunarspace-wings",
+        "The wings server implementing server management for the panel.",
+    );
+
+    let mut cli = crate::commands::commands(cli);
+    let mut matches = cli.get_matches();
+
+    CLAP_COMMAND
+        .set(cli.get_command())
+        .expect("failed to set CLAP_COMMAND");
+
+    let config_path = matches.get_one::<String>("config").cloned();
+    let config_path = config_path
+        .as_deref()
+        .or_else(|| crate::config::Config::find())
+        .unwrap_or(crate::config::Config::DEFAULT_PATH);
+    let debug = *matches
+        .get_one::<bool>("debug")
+        .expect("debug flag is required");
+    let ignore_certificate_errors = matches
+        .get_one::<bool>("ignore_certificate_errors")
+        .copied()
+        .unwrap_or(false);
+    let config = crate::config::Config::open(
+        config_path,
+        debug,
+        matches.subcommand().is_some(),
+        ignore_certificate_errors,
+    );
+
+    match matches.remove_subcommand() {
+        Some((command, arg_matches)) => {
+            if let Some((func, arg_matches)) = cli.match_command(command, arg_matches) {
+                match func(config.as_ref().ok().map(|e| e.0.clone()), arg_matches).await {
+                    Ok(exit_code) => {
+                        drop(config);
+                        std::process::exit(exit_code);
+                    }
+                    Err(err) => {
+                        drop(config);
+                        eprintln!(
+                            "{}: {:#?}",
+                            "an error occurred while running cli command".red(),
+                            err
+                        );
+                        std::process::exit(1);
+                    }
+                }
+            } else {
+                cli.print_help();
+                std::process::exit(0);
+            }
+        }
+        None => {
+            tracing::info!(" __      ___ _ __   __ _ ___        ");
+            tracing::info!(" \\ \\ /\\ / / | '_ \\ / _` / __|       ");
+            tracing::info!("  \\ V  V /| | | | | (_| \\__ \\       ");
+            tracing::info!("   \\_/\\_/ |_|_| |_|\\__, |___/__ ___ ");
+            tracing::info!("                    __/ | | '__/ __|");
+            tracing::info!("                   |___/  | |  \\__ \\");
+            tracing::info!("{: >25} |_|  |___/", crate::VERSION);
+            tracing::info!("github.com/foxstudio-201/LunarSpaceWingLunar#{}\n", crate::GIT_COMMIT);
+        }
+    }
+
+    let (config, _guard) = match config {
+        Ok(config) => config,
+        Err(err) => exit_error!("failed to load config from {}: {:?}", config_path, err),
+    };
+    tracing::info!("config loaded from {}", config_path);
+
+    crate::spawn_handled(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+        let socket = tokio::net::UdpSocket::bind("0.0.0.0:0").await?;
+        let socket = sntpc_net_tokio::UdpSocketWrapper::from(socket);
+        let context = sntpc::NtpContext::new(sntpc::StdTimestampGen::default());
+
+        let pool_ntp_addrs = crate::net::lookup_host("pool.ntp.org", 123)
+            .await
+            .context("failed to resolve pool.ntp.org")?;
+
+        let get_pool_time = async |addr: std::net::SocketAddr| {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                sntpc::get_time(addr, &socket, context),
+            )
+            .await?
+            .map_err(|err| std::io::Error::other(format!("{:?}", err)))
+            .context("failed to get time from pool.ntp.org")
+        };
+
+        for pool_ntp_addr in pool_ntp_addrs {
+            let pool_time = match get_pool_time(pool_ntp_addr).await {
+                Ok(time) => time,
+                Err(err) => {
+                    tracing::warn!("failed to get time from {:?}: {:?}", pool_ntp_addr, err);
+                    continue;
+                }
+            };
+
+            let duration = std::time::Duration::from_micros(pool_time.offset().unsigned_abs());
+
+            if duration > std::time::Duration::from_secs(5) {
+                if pool_time.offset().is_negative() {
+                    tracing::warn!(
+                        "system clock is behind by {:.2}s according to {:?}",
+                        duration.as_secs_f64(),
+                        pool_ntp_addr
+                    );
+                } else {
+                    tracing::warn!(
+                        "system clock is ahead by {:.2}s according to {:?}",
+                        duration.as_secs_f64(),
+                        pool_ntp_addr
+                    );
+                }
+            } else if pool_time.offset().is_negative() {
+                tracing::info!(
+                    "system clock is behind by {}ms according to {:?}",
+                    duration.as_millis(),
+                    pool_ntp_addr
+                );
+            } else {
+                tracing::info!(
+                    "system clock is ahead by {}ms according to {:?}",
+                    duration.as_millis(),
+                    pool_ntp_addr
+                );
+            }
+        }
+
+        Ok::<_, anyhow::Error>(())
+    });
+
+    tracing::info!("connecting to docker");
+    let (executor, docker) = {
+        let config_ref = config.load();
+        let docker = Arc::new(
+            match if config_ref.docker.socket.starts_with("http://")
+                || config_ref.docker.socket.starts_with("tcp://")
+            {
+                bollard::Docker::connect_with_http(
+                    &config_ref.docker.socket,
+                    120,
+                    bollard::API_DEFAULT_VERSION,
+                )
+            } else {
+                bollard::Docker::connect_with_local(
+                    &config_ref.docker.socket,
+                    120,
+                    bollard::API_DEFAULT_VERSION,
+                )
+            } {
+                Ok(docker) => docker,
+                Err(err) => exit_error!("failed to connect to docker: {:?}", err),
+            },
+        );
+
+        let own_container =
+            crate::server::executor::docker::DockerExecutor::own_container(&docker).await;
+        let firewall =
+            crate::server::firewall::create(&config, &docker, own_container.as_ref()).await;
+
+        (
+            Arc::new(crate::server::executor::docker::DockerExecutor::new(
+                Arc::clone(&docker),
+                config.clone(),
+                firewall,
+            )),
+            docker,
+        )
+    };
+
+    tracing::info!("running server executor boot tasks");
+    if let Err(err) = executor.boot().await {
+        exit_error!("failed to boot server executor: {:?}", err);
+    }
+
+    match config.client.reset_state().await {
+        Ok(_) => tracing::info!("remote state reset successfully"),
+        Err(err) => exit_error!("failed to reset remote state: {:?}", err),
+    }
+
+    if config.load().system.disk_limiter_mode
+        == crate::server::filesystem::limiter::DiskLimiterMode::BtrfsSubvolume
+    {
+        tracing::info!("cleaning up stale btrfs send snapshots from previous runs");
+        crate::server::backup::adapters::btrfs::BtrfsBackup::cleanup_stale_btrfs_send_snapshots(
+            &config,
+        )
+        .await;
+    }
+
+    tracing::info!("creating server manager");
+    let servers = match config.client.servers().await {
+        Ok(servers) => servers,
+        Err(err) => exit_error!("failed to fetch servers from remote: {:?}", err),
+    };
+
+    for attempt in 1..=3 {
+        match executor.reconcile_firewall(&servers).await {
+            Ok(()) => break,
+            Err(err) if attempt < 3 => {
+                tracing::warn!(
+                    "failed to reconcile server firewall rules, retrying: {:#}",
+                    err
+                );
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+            Err(err) => {
+                tracing::error!("failed to reconcile server firewall rules: {:#}", err);
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    let tundra = if config.load().tundra.enabled {
+        match crate::tundra::TundraManager::create(&config, Arc::clone(&docker)) {
+            Ok(tundra) => Some(tundra),
+            Err(err) => exit_error!("failed to set up the tundra control plane: {:?}", err),
+        }
+    } else {
+        None
+    };
+    #[cfg(not(unix))]
+    let _ = docker;
+
+    let state = Arc::new(crate::routes::AppState {
+        start_time: Instant::now(),
+        container_type: match std::env::var("OCI_CONTAINER").as_deref() {
+            Ok("official") => crate::routes::AppContainerType::Official,
+            Ok(_) => crate::routes::AppContainerType::Unknown,
+            Err(_) => crate::routes::AppContainerType::None,
+        },
+        version: crate::full_version(),
+
+        config: Arc::clone(&config),
+        executor,
+        stats_manager: Arc::new(crate::stats::StatsManager::default()),
+        server_manager: Arc::new(crate::server::manager::ServerManager::new(&servers)),
+        backup_manager: Arc::new(crate::server::backup::manager::BackupManager::default()),
+        inotify_manager: Arc::new(crate::server::filesystem::inotify::InotifyManager::new()),
+        websocket_limiter: Arc::new(crate::server::websocket::limiter::WebsocketLimiter::new(
+            Arc::clone(&config),
+        )),
+        mime_cache: crate::routes::MimeCache::new(crate::routes::mime_cache_capacity(
+            config.load().api.directory_entry_limit,
+        )),
+        fingerprint_cache: crate::routes::FingerprintCache::default(),
+        listing_work: Arc::new(crate::server::filesystem::listing::ListingWork::default()),
+        #[cfg(unix)]
+        tundra,
+    });
+
+    tokio::spawn({
+        let state = Arc::clone(&state);
+
+        async move {
+            state.server_manager.boot(&state, servers).await;
+        }
+    });
+
+    #[cfg(unix)]
+    if state.tundra.is_some() {
+        tokio::spawn({
+            let state = Arc::clone(&state);
+
+            async move {
+                if let Err(err) = crate::tundra::shim::serve(state).await {
+                    tracing::error!("the tundra control plane stopped: {:#}", err);
+                }
+            }
+        });
+
+        tokio::spawn(crate::tundra::run(Arc::clone(&state)));
+    }
+
+    let app = OpenApiRouter::new()
+        .merge(crate::routes::router(&state))
+        .fallback(|state: GetState, req: Request| async move {
+            let config = state.config.load();
+            if let Some(redirect) = config.api.redirects.get(req.uri().path()) {
+                return ApiResponse::new(Body::empty())
+                    .with_status(StatusCode::FOUND)
+                    .with_header("Location", redirect)
+                    .ok();
+            }
+
+            ApiResponse::error("route not found")
+                .with_status(StatusCode::NOT_FOUND)
+                .ok()
+        })
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            handle_cors,
+        ))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            handle_request,
+        ))
+        .layer(tower_http::catch_panic::CatchPanicLayer::custom(
+            handle_panic,
+        ))
+        .with_state(state.clone());
+
+    let (mut router, mut openapi) = app.split_for_parts();
+    openapi.info.version = "1.0.0".into();
+    openapi.info.description = None;
+    openapi.info.title = format!("{} Wings API", config.load().app_name);
+    openapi.info.contact = None;
+    openapi.info.license = None;
+    if let Some(components) = openapi.components.as_mut() {
+        components.add_security_scheme(
+            "api_key",
+            SecurityScheme::ApiKey(ApiKey::Header(ApiKeyValue::new("Authorization"))),
+        );
+    }
+
+    for (path, item) in openapi.paths.paths.iter_mut() {
+        let operations = [
+            ("get", &mut item.get),
+            ("post", &mut item.post),
+            ("put", &mut item.put),
+            ("patch", &mut item.patch),
+            ("delete", &mut item.delete),
+        ];
+
+        let path = path
+            .replace('/', "_")
+            .replace(|c| ['{', '}'].contains(&c), "");
+
+        for (method, operation) in operations {
+            if let Some(operation) = operation {
+                operation.operation_id = Some(format!("{method}{path}"))
+            }
+        }
+    }
+
+    if !config.load().api.disable_openapi_docs {
+        router = router.route(
+            "/openapi.json",
+            axum::routing::get(|| async move { axum::Json(openapi) }),
+        );
+    }
+
+    if let Err(err) = rustls::crypto::aws_lc_rs::default_provider().install_default() {
+        exit_error!("Failed to install rustls crypto provider: {:?}", err);
+    }
+
+    if config.load().system.sftp.enabled {
+        tracing::info!("starting ssh server");
+
+        tokio::spawn({
+            let state = Arc::clone(&state);
+
+            async move {
+                let mut server = crate::ssh::Server::new(Arc::clone(&state));
+
+                let cfg = state.config.load();
+                let key_file = cfg
+                    .system
+                    .data_directory
+                    .as_path(&cfg)
+                    .join(".sftp")
+                    .join(format!(
+                        "id_{}",
+                        state
+                            .config
+                            .load()
+                            .system
+                            .sftp
+                            .key_algorithm
+                            .replace("-", "_")
+                    ));
+                drop(cfg);
+
+                let key = match tokio::fs::read(&key_file)
+                    .await
+                    .map(russh::keys::PrivateKey::from_openssh)
+                {
+                    Ok(Ok(key)) => {
+                        tracing::info!(
+                            algorithm = %key.algorithm().to_string(),
+                            fingerprint = %key.fingerprint(Default::default()),
+                            "loaded existing sftp host key"
+                        );
+
+                        key
+                    }
+                    _ => {
+                        tracing::info!(
+                            algorithm = %state.config.load().system.sftp.key_algorithm,
+                            "generating new sftp host key"
+                        );
+
+                        let algorithm = match state.config.load().system.sftp.key_algorithm.parse()
+                        {
+                            Ok(alg) => alg,
+                            Err(_) => exit_error!("invalid sftp host key algorithm configured"),
+                        };
+
+                        let key = match tokio::task::spawn_blocking(move || {
+                            russh::keys::PrivateKey::random(
+                                &mut rand::rngs::ThreadRng::default(),
+                                algorithm,
+                            )
+                        })
+                        .await
+                        {
+                            Ok(Ok(key)) => key,
+                            Ok(Err(err)) => {
+                                exit_error!("failed to generate sftp host key: {:?}", err)
+                            }
+                            Err(err) => exit_error!("failed to generate sftp host key: {:?}", err),
+                        };
+
+                        if let Some(parent) = key_file.parent()
+                            && let Err(err) = tokio::fs::create_dir_all(parent).await
+                        {
+                            exit_error!("failed to create sftp host key directory: {:?}", err);
+                        }
+                        if let Err(err) = tokio::fs::write(
+                            key_file,
+                            key.to_openssh(russh::keys::ssh_key::LineEnding::LF)
+                                .expect("failed to convert sftp host key to OpenSSH format"),
+                        )
+                        .await
+                        {
+                            exit_error!("failed to write sftp host key: {:?}", err);
+                        }
+
+                        tracing::info!(
+                            algorithm = %key.algorithm().to_string(),
+                            fingerprint = %key.fingerprint(Default::default()),
+                            "new sftp host key generated"
+                        );
+
+                        key
+                    }
+                };
+
+                let config = russh::server::Config {
+                    server_id: russh::SshId::Standard("SSH-2.0-Calagopus-Wings".into()),
+                    auth_rejection_time: std::time::Duration::from_secs(0),
+                    auth_rejection_time_initial: Some(std::time::Duration::from_secs(0)),
+                    maximum_packet_size: 32 * 1024,
+                    keepalive_interval: Some(std::time::Duration::from_secs(60)),
+                    max_auth_attempts: 6,
+                    channel_buffer_size: 1024,
+                    event_buffer_size: 1024,
+                    keys: vec![key],
+                    ..Default::default()
+                };
+
+                let address = SocketAddr::from((
+                    state.config.load().system.sftp.bind_address,
+                    state.config.load().system.sftp.bind_port,
+                ));
+
+                tracing::info!(
+                    "ssh server listening on {} (app@{}, {}ms)",
+                    address.to_string(),
+                    crate::VERSION,
+                    state.start_time.elapsed().as_millis()
+                );
+
+                let listener = match tokio::net::TcpListener::bind(address).await {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::AddrInUse {
+                            exit_error!("failed to start ssh server ({} already in use)", address);
+                        } else {
+                            exit_error!("failed to start ssh server: {:?}", err);
+                        }
+                    }
+                };
+                crate::net::apply_socket_congestion_control(&listener, &state.config);
+
+                match server.run_on_socket(Arc::new(config), &listener).await {
+                    Ok(_) => {}
+                    Err(err) => {
+                        exit_error!("failed to start ssh server: {:?}", err);
+                    }
+                }
+            }
+        });
+    }
+
+    #[cfg(unix)]
+    tokio::spawn(async move {
+        let Ok(mut signal) = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::hangup())
+        else {
+            return;
+        };
+
+        loop {
+            signal.recv().await;
+            tracing::info!("received SIGHUP, ignoring");
+        }
+    });
+
+    if let Ok(host) = state.config.load().api.host.parse::<std::net::IpAddr>() {
+        let address = SocketAddr::from((host, state.config.load().api.port));
+
+        if config.load().api.ssl.enabled {
+            tracing::info!("loading ssl certs");
+
+            #[cfg(not(target_os = "linux"))]
+            if config.load().api.ssl.ktls_enabled {
+                tracing::warn!("kernel tls is only supported on linux, using userspace tls");
+            }
+
+            #[cfg(target_os = "linux")]
+            let ktls_ciphers = if config.load().api.ssl.ktls_enabled {
+                crate::tls::detect_ktls_support().await
+            } else {
+                None
+            };
+
+            #[cfg(target_os = "linux")]
+            let ktls = ktls_ciphers.is_some();
+            #[cfg(not(target_os = "linux"))]
+            let ktls = false;
+
+            let rustls_config = match crate::tls::server_config(
+                config.load().api.ssl.cert.as_str(),
+                config.load().api.ssl.key.as_str(),
+                ktls,
+            )
+            .await
+            {
+                Ok(server_config) => {
+                    axum_server::tls_rustls::RustlsConfig::from_config(server_config)
+                }
+                Err(err) => exit_error!("failed to load SSL certificate and key: {:?}", err),
+            };
+
+            tokio::spawn({
+                let rustls_config = rustls_config.clone();
+                let config = config.clone();
+
+                async move {
+                    loop {
+                        tokio::time::sleep(std::time::Duration::from_hours(24)).await;
+                        tracing::info!("reloading ssl certs");
+
+                        match crate::tls::server_config(
+                            config.load().api.ssl.cert.as_str(),
+                            config.load().api.ssl.key.as_str(),
+                            ktls,
+                        )
+                        .await
+                        {
+                            Ok(server_config) => {
+                                rustls_config.reload_from_config(server_config);
+                                tracing::info!("ssl certs reloaded successfully");
+                            }
+                            Err(err) => {
+                                tracing::error!(
+                                    "failed to reload SSL certificate and key: {:?}",
+                                    err
+                                );
+                            }
+                        }
+                    }
+                }
+            });
+
+            tracing::info!("https listening on {}", address.to_string());
+
+            #[cfg(target_os = "linux")]
+            let result = {
+                let listener = match std::net::TcpListener::bind(address)
+                    .and_then(|listener| listener.set_nonblocking(true).map(|()| listener))
+                {
+                    Ok(listener) => listener,
+                    Err(err) => {
+                        if err.kind() == std::io::ErrorKind::AddrInUse {
+                            exit_error!(
+                                "failed to start https server ({} already in use)",
+                                address
+                            );
+                        } else {
+                            exit_error!("failed to start https server: {:?}", err);
+                        }
+                    }
+                };
+                crate::net::apply_socket_congestion_control(&listener, &config);
+
+                match ktls_ciphers {
+                    Some(ciphers) => match axum_server::from_tcp(listener) {
+                        Ok(mut server) => {
+                            server.http_builder().http2().adaptive_window(true);
+
+                            server
+                                .acceptor(crate::tls::KtlsAcceptor::new(rustls_config, ciphers))
+                                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                                .await
+                        }
+                        Err(err) => exit_error!("failed to start https server: {:?}", err),
+                    },
+                    None => match axum_server::tls_rustls::from_tcp_rustls(listener, rustls_config)
+                    {
+                        Ok(mut server) => {
+                            server.http_builder().http2().adaptive_window(true);
+
+                            server
+                                .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                                .await
+                        }
+                        Err(err) => exit_error!("failed to start https server: {:?}", err),
+                    },
+                }
+            };
+
+            #[cfg(not(target_os = "linux"))]
+            let result = {
+                let mut server = axum_server::bind_rustls(address, rustls_config);
+                server.http_builder().http2().adaptive_window(true);
+
+                server
+                    .serve(router.into_make_service_with_connect_info::<SocketAddr>())
+                    .await
+            };
+
+            match result {
+                Ok(_) => {}
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::AddrInUse {
+                        exit_error!("failed to start https server ({} already in use)", address);
+                    } else {
+                        exit_error!("failed to start https server: {:?}", err);
+                    }
+                }
+            }
+        } else {
+            tracing::info!("http listening on {}", address.to_string());
+
+            let listener = match tokio::net::TcpListener::bind(address).await {
+                Ok(listener) => listener,
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::AddrInUse {
+                        exit_error!("failed to start http server ({} already in use)", address);
+                    } else {
+                        exit_error!("failed to start http server: {:?}", err);
+                    }
+                }
+            };
+            crate::net::apply_socket_congestion_control(&listener, &config);
+
+            match axum::serve(
+                listener,
+                router.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            {
+                Ok(_) => {}
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::AddrInUse {
+                        exit_error!("failed to start http server ({} already in use)", address);
+                    } else {
+                        exit_error!("failed to start http server: {:?}", err);
+                    }
+                }
+            }
+        }
+    } else {
+        #[cfg(unix)]
+        {
+            let socket_path = state.config.load().api.host.clone();
+
+            tracing::info!("http server listening on {}", socket_path);
+
+            let router = router.layer(axum::middleware::from_fn(
+                |mut req: Request, next: Next| async move {
+                    req.extensions_mut().insert(ConnectInfo(SocketAddr::from((
+                        std::net::IpAddr::from([127, 0, 0, 1]),
+                        0,
+                    ))));
+                    next.run(req).await
+                },
+            ));
+
+            let _ = tokio::fs::remove_file(&socket_path).await;
+            let listener = match tokio::net::UnixListener::bind(&socket_path) {
+                Ok(listener) => listener,
+                Err(err) => {
+                    exit_error!("failed to bind to unix socket ({}): {:?}", socket_path, err)
+                }
+            };
+
+            if let Err(err) = axum::serve(listener, router.into_make_service()).await {
+                exit_error!("failed to start http server ({}): {:?}", socket_path, err);
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            exit_error!("unix socket support is only available on unix systems");
+        }
+    }
+}
+
+fn main() {
+    let thread_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .max_blocking_threads(1024)
+        .thread_name_fn({
+            let thread_count = thread_count.clone();
+            move || {
+                let count = thread_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                format!("lunarspace-wings-rt-{count}")
+            }
+        })
+        .name("lunarspace-wings-rt")
+        .build()
+        .expect("failed to build Tokio runtime")
+        .block_on(main_rt());
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn malloc_conf_is_applied() {
+        use tikv_jemalloc_ctl::raw;
+
+        // SAFETY: opt.narenas is a read-only unsigned int option.
+        let narenas: std::ffi::c_uint =
+            unsafe { raw::read(b"opt.narenas\0") }.expect("read opt.narenas");
+        assert_eq!(narenas, 4, "narenas from MALLOC_CONF was not applied");
+
+        // SAFETY: opt.background_thread is a read-only bool option.
+        let background: bool =
+            unsafe { raw::read(b"opt.background_thread\0") }.expect("read opt.background_thread");
+        assert!(
+            background,
+            "background_thread from MALLOC_CONF was not applied"
+        );
+
+        // SAFETY: opt.dirty_decay_ms is a read-only ssize_t option.
+        let dirty_decay: isize =
+            unsafe { raw::read(b"opt.dirty_decay_ms\0") }.expect("read opt.dirty_decay_ms");
+        assert_eq!(dirty_decay, 1000, "dirty_decay_ms was not applied");
+    }
+}
